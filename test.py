@@ -82,10 +82,11 @@ cntr = 1
 scale = 0.5
 while True:
     sct_frame = sct.grab(monitor)
-    if cntr < 20:
+    if cntr < 30:
         cntr+=1
         continue
     img = np.array(sct_frame)
+    cv2.resize(img,(1280,720))
     img = cv2.cvtColor(img,cv2.COLOR_BGRA2BGR)
     imgH,imgW,_ = img.shape
     new_width = int(imgW * scale)

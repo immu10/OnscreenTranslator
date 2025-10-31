@@ -1,0 +1,6 @@
+opencv-python
+numpy
+pytesseract
+easyocr
+imutils
+mss
