@@ -2,10 +2,10 @@ import threading
 import queue
 import logging
 import cv2
-import dxcam
 import torch
 import easyocr
 from translate import translate
+from stream import Stream
 
 logging.basicConfig(
     filename="boxID.log",
@@ -13,6 +13,9 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(message)s",
 )
+for noisy in ("httpx", "httpcore", "urllib3", "huggingface_hub",
+              "transformers", "filelock"):
+    logging.getLogger(noisy).setLevel(logging.WARNING)
 box_log = logging.getLogger("boxID")
 
 MONITOR_INDEX = 1
@@ -23,6 +26,7 @@ Y_GAP_RATIO = 0.4
 IOU_CARRY_THRESHOLD = 0.5
 MIN_BOX_W = 16
 MIN_BOX_H = 10
+OCR_UPSCALE = 2.0
 
 
 def group_boxes(boxes):
@@ -180,35 +184,44 @@ def ocr_worker():
         except queue.Empty:
             continue
         try:
-            r = reader.readtext(crop, detail=0, paragraph=True)
-            text = " ".join(r).strip()
+            try:
+                r = reader.readtext(crop, detail=0, paragraph=True)
+                text = " ".join(r).strip()
+            except Exception:
+                box_log.exception("ocr readtext failed")
+                text = ""
+            if not text:
+                continue
+
+            cached = False
+            with translation_cache_lock:
+                trans = translation_cache.get(text)
+                if trans is not None:
+                    cached = True
+            if not cached:
+                try:
+                    trans = translate(text)
+                except Exception:
+                    box_log.exception("translate failed for text=%r", text)
+                    trans = ""
+                with translation_cache_lock:
+                    translation_cache[text] = trans
+
+            with results_lock:
+                best = 0.0
+                best_i = -1
+                for i, (pb, _, _) in enumerate(results):
+                    io = iou(box, pb)
+                    if io > best:
+                        best = io
+                        best_i = i
+                if best_i >= 0 and best >= IOU_CARRY_THRESHOLD:
+                    results[best_i] = (results[best_i][0], text, trans)
+
+            box_log.info("ocr %s text=%r trans=%r",
+                         "cache" if cached else "new", text, trans)
         except Exception:
-            text = ""
-        if not text:
-            continue
-
-        with translation_cache_lock:
-            if text in translation_cache:
-                trans = translation_cache[text]
-                cached = True
-            else:
-                trans = translate(text)
-                translation_cache[text] = trans
-                cached = False
-
-        with results_lock:
-            best = 0.0
-            best_i = -1
-            for i, (pb, _, _) in enumerate(results):
-                io = iou(box, pb)
-                if io > best:
-                    best = io
-                    best_i = i
-            if best_i >= 0 and best >= IOU_CARRY_THRESHOLD:
-                results[best_i] = (results[best_i][0], text, trans)
-
-        box_log.info("ocr %s text=%r trans=%r",
-                     "cache" if cached else "new", text, trans)
+            box_log.exception("ocr_worker loop error")
 
 
 detector_thread = threading.Thread(target=detector_worker, daemon=True)
@@ -218,12 +231,12 @@ ocr_thread.start()
 
 cv2.namedWindow("screen-ocr", cv2.WINDOW_NORMAL)
 
-camera = dxcam.create(output_idx=MONITOR_INDEX, output_color="BGR")
-camera.start(target_fps=TARGET_FPS, video_mode=True)
+stream = Stream(monitor=MONITOR_INDEX, target_fps=TARGET_FPS)
+stream.start()
 
 try:
     while True:
-        frame = camera.get_latest_frame()
+        frame = stream.get_frame()
 
         with latest_frame_lock:
             latest_frame = frame
@@ -245,7 +258,7 @@ try:
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 finally:
-    camera.stop()
+    stream.stop()
     stop_event.set()
     detector_thread.join(timeout=1.0)
     ocr_thread.join(timeout=1.0)
