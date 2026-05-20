@@ -1,6 +1,5 @@
 opencv-python
 numpy
-pytesseract
+torch
 easyocr
-imutils
-mss
+dxcam
