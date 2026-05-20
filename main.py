@@ -1,19 +1,28 @@
 import threading
+import queue
+import logging
 import cv2
 import dxcam
 import torch
 import easyocr
+from translate import translate
 
-MONITOR_INDEX = 0
+logging.basicConfig(
+    filename="boxID.log",
+    filemode="w",
+    level=logging.INFO,
+    format="%(asctime)s %(message)s",
+)
+box_log = logging.getLogger("boxID")
+
+MONITOR_INDEX = 1
 TARGET_FPS = 60
-HASH_HAMMING_MAX = 12
-HASH_HAMMING_MAX_DORMANT = 8
-TRACK_MAX_CENTROID_DIST = 150
-TRACK_TTL_FRAMES = 600
-DORMANT_AFTER_FRAMES = 2
 OCR_HEIGHT = 720
 X_GAP_RATIO = 0.8
 Y_GAP_RATIO = 0.4
+IOU_CARRY_THRESHOLD = 0.5
+MIN_BOX_W = 16
+MIN_BOX_H = 10
 
 
 def group_boxes(boxes):
@@ -61,166 +70,151 @@ def group_boxes(boxes):
         merged.append(((min(xs1), min(ys1)), (max(xs2), max(ys2))))
     return merged
 
+
+def iou(a, b):
+    (ax1, ay1), (ax2, ay2) = a
+    (bx1, by1), (bx2, by2) = b
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+    iw = max(0, ix2 - ix1)
+    ih = max(0, iy2 - iy1)
+    inter = iw * ih
+    if inter == 0:
+        return 0.0
+    aa = (ax2 - ax1) * (ay2 - ay1)
+    bb = (bx2 - bx1) * (by2 - by1)
+    return inter / (aa + bb - inter)
+
+
 cuda_ok = torch.cuda.is_available()
 print(f"CUDA available: {cuda_ok}"
       + (f" ({torch.cuda.get_device_name(0)})" if cuda_ok else ""))
-reader = easyocr.Reader(['en'], gpu=cuda_ok)
+reader = easyocr.Reader(['ko', 'en'], gpu=cuda_ok)
 
 latest_frame = None
 latest_frame_lock = threading.Lock()
-latest_tracks = []
-detections_lock = threading.Lock()
 stop_event = threading.Event()
 
-tracks = {}
-next_track_id = 1
-frame_counter = 0
+results = []
+results_lock = threading.Lock()
+
+translation_cache = {}
+translation_cache_lock = threading.Lock()
+
+ocr_queue = queue.Queue(maxsize=128)
 
 
-def ahash(crop):
-    g = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    g = cv2.resize(g, (8, 8), interpolation=cv2.INTER_AREA)
-    bits = (g > g.mean()).flatten()
-    h = 0
-    for b in bits:
-        h = (h << 1) | int(b)
-    return h
-
-
-def hamming(a, b):
-    return bin(a ^ b).count("1")
-
-
-def update_tracks(frame, boxes):
-    global next_track_id, frame_counter
-    frame_counter += 1
-    fh, fw = frame.shape[:2]
-
-    observations = []
-    for (x1, y1), (x2, y2) in boxes:
-        mx = int((x2 - x1) * 0.1)
-        my = int((y2 - y1) * 0.1)
-        x1c = max(0, x1 - mx)
-        y1c = max(0, y1 - my)
-        x2c = min(fw, x2 + mx)
-        y2c = min(fh, y2 + my)
-        if x2c - x1c < 4 or y2c - y1c < 4:
-            continue
-        crop = frame[y1c:y2c, x1c:x2c]
-        cx = (x1 + x2) * 0.5
-        cy = (y1 + y2) * 0.5
-        observations.append({
-            "box": ((x1, y1), (x2, y2)),
-            "hash": ahash(crop),
-            "centroid": (cx, cy),
-        })
-
-    used_obs, used_tid = set(), set()
-    assignments = {}
-
-    visible_cands = []
-    for oi, obs in enumerate(observations):
-        for tid, tr in tracks.items():
-            if frame_counter - tr["last_seen"] > DORMANT_AFTER_FRAMES:
-                continue
-            dx = obs["centroid"][0] - tr["centroid"][0]
-            dy = obs["centroid"][1] - tr["centroid"][1]
-            dist = (dx * dx + dy * dy) ** 0.5
-            if dist > TRACK_MAX_CENTROID_DIST:
-                continue
-            ham = hamming(obs["hash"], tr["hash"])
-            if ham > HASH_HAMMING_MAX:
-                continue
-            visible_cands.append((ham, dist, oi, tid))
-
-    visible_cands.sort()
-    for ham, dist, oi, tid in visible_cands:
-        if oi in used_obs or tid in used_tid:
-            continue
-        assignments[oi] = tid
-        used_obs.add(oi)
-        used_tid.add(tid)
-
-    dormant_cands = []
-    for oi, obs in enumerate(observations):
-        if oi in used_obs:
-            continue
-        for tid, tr in tracks.items():
-            if tid in used_tid:
-                continue
-            if frame_counter - tr["last_seen"] <= DORMANT_AFTER_FRAMES:
-                continue
-            ham = hamming(obs["hash"], tr["hash"])
-            if ham > HASH_HAMMING_MAX_DORMANT:
-                continue
-            dormant_cands.append((ham, oi, tid))
-
-    dormant_cands.sort()
-    for ham, oi, tid in dormant_cands:
-        if oi in used_obs or tid in used_tid:
-            continue
-        assignments[oi] = tid
-        used_obs.add(oi)
-        used_tid.add(tid)
-
-    new_tracks = {}
-    for oi, obs in enumerate(observations):
-        tid = assignments.get(oi)
-        if tid is None:
-            tid = next_track_id
-            next_track_id += 1
-        new_tracks[tid] = {
-            "box": obs["box"],
-            "hash": obs["hash"],
-            "centroid": obs["centroid"],
-            "last_seen": frame_counter,
-        }
-
-    for tid, tr in tracks.items():
-        if tid in new_tracks:
-            continue
-        if frame_counter - tr["last_seen"] <= TRACK_TTL_FRAMES:
-            new_tracks[tid] = tr
-
-    tracks.clear()
-    tracks.update(new_tracks)
-    return [(tid, tr["box"]) for tid, tr in tracks.items()
-            if tr["last_seen"] == frame_counter]
-
-
-def ocr_worker():
+def detector_worker():
     while not stop_event.is_set():
         with latest_frame_lock:
             frame = None if latest_frame is None else latest_frame.copy()
         if frame is None:
             stop_event.wait(0.01)
             continue
-        h, w = frame.shape[:2]
-        scale = OCR_HEIGHT / h
-        small = cv2.resize(frame, (int(w * scale), OCR_HEIGHT))
+        fh, fw = frame.shape[:2]
+        scale = OCR_HEIGHT / fh
+        small = cv2.resize(frame, (int(fw * scale), OCR_HEIGHT))
         horizontal_list, free_list = reader.detect(small)
         inv = 1.0 / scale
-        boxes = []
+        raw = []
         for x_min, x_max, y_min, y_max in horizontal_list[0]:
-            boxes.append((
+            raw.append((
                 (int(x_min * inv), int(y_min * inv)),
                 (int(x_max * inv), int(y_max * inv)),
             ))
         for quad in free_list[0]:
             xs = [p[0] for p in quad]
             ys = [p[1] for p in quad]
-            boxes.append((
+            raw.append((
                 (int(min(xs) * inv), int(min(ys) * inv)),
                 (int(max(xs) * inv), int(max(ys) * inv)),
             ))
-        grouped = group_boxes(boxes)
-        active = update_tracks(frame, grouped)
-        with detections_lock:
-            latest_tracks[:] = active
+        grouped = group_boxes(raw)
+
+        with results_lock:
+            prev = list(results)
+
+        new_results = []
+        for box in grouped:
+            (x1, y1), (x2, y2) = box
+            if x2 - x1 < MIN_BOX_W or y2 - y1 < MIN_BOX_H:
+                continue
+
+            text, trans = "", ""
+            best = 0.0
+            for (pb, pt, ptr) in prev:
+                io = iou(box, pb)
+                if io > best:
+                    best = io
+                    if io >= IOU_CARRY_THRESHOLD and pt:
+                        text, trans = pt, ptr
+
+            if not text:
+                x1c = max(0, x1)
+                y1c = max(0, y1)
+                x2c = min(fw, x2)
+                y2c = min(fh, y2)
+                if x2c - x1c >= 4 and y2c - y1c >= 4:
+                    crop = frame[y1c:y2c, x1c:x2c].copy()
+                    try:
+                        ocr_queue.put_nowait((box, crop))
+                    except queue.Full:
+                        pass
+
+            new_results.append((box, text, trans))
+
+        with results_lock:
+            results[:] = new_results
+
+        for box, text, trans in new_results:
+            (x1, y1), (x2, y2) = box
+            box_log.info("det box=(%d,%d,%d,%d) text=%r", x1, y1, x2, y2, text)
 
 
-worker = threading.Thread(target=ocr_worker, daemon=True)
-worker.start()
+def ocr_worker():
+    while not stop_event.is_set():
+        try:
+            box, crop = ocr_queue.get(timeout=0.1)
+        except queue.Empty:
+            continue
+        try:
+            r = reader.readtext(crop, detail=0, paragraph=True)
+            text = " ".join(r).strip()
+        except Exception:
+            text = ""
+        if not text:
+            continue
+
+        with translation_cache_lock:
+            if text in translation_cache:
+                trans = translation_cache[text]
+                cached = True
+            else:
+                trans = translate(text)
+                translation_cache[text] = trans
+                cached = False
+
+        with results_lock:
+            best = 0.0
+            best_i = -1
+            for i, (pb, _, _) in enumerate(results):
+                io = iou(box, pb)
+                if io > best:
+                    best = io
+                    best_i = i
+            if best_i >= 0 and best >= IOU_CARRY_THRESHOLD:
+                results[best_i] = (results[best_i][0], text, trans)
+
+        box_log.info("ocr %s text=%r trans=%r",
+                     "cache" if cached else "new", text, trans)
+
+
+detector_thread = threading.Thread(target=detector_worker, daemon=True)
+detector_thread.start()
+ocr_thread = threading.Thread(target=ocr_worker, daemon=True)
+ocr_thread.start()
 
 cv2.namedWindow("screen-ocr", cv2.WINDOW_NORMAL)
 
@@ -234,19 +228,25 @@ try:
         with latest_frame_lock:
             latest_frame = frame
 
-        with detections_lock:
-            active = list(latest_tracks)
+        display = frame.copy()
 
-        for tid, (pt1, pt2) in active:
-            cv2.rectangle(frame, pt1, pt2, (0, 255, 0), 2)
-            cv2.putText(frame, f"#{tid}", (pt1[0], max(pt1[1] - 6, 16)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
+        with results_lock:
+            snapshot = list(results)
 
-        cv2.imshow("screen-ocr", frame)
+        for box, text, trans in snapshot:
+            (pt1, pt2) = box
+            cv2.rectangle(display, pt1, pt2, (0, 255, 0), 2)
+            label = trans or text
+            if label:
+                cv2.putText(display, label, (pt1[0], max(pt1[1] - 6, 16)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
+
+        cv2.imshow("screen-ocr", display)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 finally:
     camera.stop()
     stop_event.set()
-    worker.join(timeout=1.0)
+    detector_thread.join(timeout=1.0)
+    ocr_thread.join(timeout=1.0)
     cv2.destroyAllWindows()
