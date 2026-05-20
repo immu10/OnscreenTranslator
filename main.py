@@ -6,6 +6,11 @@ import easyocr
 
 MONITOR_INDEX = 0
 TARGET_FPS = 60
+HASH_HAMMING_MAX = 12
+HASH_HAMMING_MAX_DORMANT = 8
+TRACK_MAX_CENTROID_DIST = 150
+TRACK_TTL_FRAMES = 600
+DORMANT_AFTER_FRAMES = 2
 OCR_HEIGHT = 720
 X_GAP_RATIO = 0.8
 Y_GAP_RATIO = 0.4
@@ -63,9 +68,124 @@ reader = easyocr.Reader(['en'], gpu=cuda_ok)
 
 latest_frame = None
 latest_frame_lock = threading.Lock()
-latest_detections = []
+latest_tracks = []
 detections_lock = threading.Lock()
 stop_event = threading.Event()
+
+tracks = {}
+next_track_id = 1
+frame_counter = 0
+
+
+def ahash(crop):
+    g = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    g = cv2.resize(g, (8, 8), interpolation=cv2.INTER_AREA)
+    bits = (g > g.mean()).flatten()
+    h = 0
+    for b in bits:
+        h = (h << 1) | int(b)
+    return h
+
+
+def hamming(a, b):
+    return bin(a ^ b).count("1")
+
+
+def update_tracks(frame, boxes):
+    global next_track_id, frame_counter
+    frame_counter += 1
+    fh, fw = frame.shape[:2]
+
+    observations = []
+    for (x1, y1), (x2, y2) in boxes:
+        mx = int((x2 - x1) * 0.1)
+        my = int((y2 - y1) * 0.1)
+        x1c = max(0, x1 - mx)
+        y1c = max(0, y1 - my)
+        x2c = min(fw, x2 + mx)
+        y2c = min(fh, y2 + my)
+        if x2c - x1c < 4 or y2c - y1c < 4:
+            continue
+        crop = frame[y1c:y2c, x1c:x2c]
+        cx = (x1 + x2) * 0.5
+        cy = (y1 + y2) * 0.5
+        observations.append({
+            "box": ((x1, y1), (x2, y2)),
+            "hash": ahash(crop),
+            "centroid": (cx, cy),
+        })
+
+    used_obs, used_tid = set(), set()
+    assignments = {}
+
+    visible_cands = []
+    for oi, obs in enumerate(observations):
+        for tid, tr in tracks.items():
+            if frame_counter - tr["last_seen"] > DORMANT_AFTER_FRAMES:
+                continue
+            dx = obs["centroid"][0] - tr["centroid"][0]
+            dy = obs["centroid"][1] - tr["centroid"][1]
+            dist = (dx * dx + dy * dy) ** 0.5
+            if dist > TRACK_MAX_CENTROID_DIST:
+                continue
+            ham = hamming(obs["hash"], tr["hash"])
+            if ham > HASH_HAMMING_MAX:
+                continue
+            visible_cands.append((ham, dist, oi, tid))
+
+    visible_cands.sort()
+    for ham, dist, oi, tid in visible_cands:
+        if oi in used_obs or tid in used_tid:
+            continue
+        assignments[oi] = tid
+        used_obs.add(oi)
+        used_tid.add(tid)
+
+    dormant_cands = []
+    for oi, obs in enumerate(observations):
+        if oi in used_obs:
+            continue
+        for tid, tr in tracks.items():
+            if tid in used_tid:
+                continue
+            if frame_counter - tr["last_seen"] <= DORMANT_AFTER_FRAMES:
+                continue
+            ham = hamming(obs["hash"], tr["hash"])
+            if ham > HASH_HAMMING_MAX_DORMANT:
+                continue
+            dormant_cands.append((ham, oi, tid))
+
+    dormant_cands.sort()
+    for ham, oi, tid in dormant_cands:
+        if oi in used_obs or tid in used_tid:
+            continue
+        assignments[oi] = tid
+        used_obs.add(oi)
+        used_tid.add(tid)
+
+    new_tracks = {}
+    for oi, obs in enumerate(observations):
+        tid = assignments.get(oi)
+        if tid is None:
+            tid = next_track_id
+            next_track_id += 1
+        new_tracks[tid] = {
+            "box": obs["box"],
+            "hash": obs["hash"],
+            "centroid": obs["centroid"],
+            "last_seen": frame_counter,
+        }
+
+    for tid, tr in tracks.items():
+        if tid in new_tracks:
+            continue
+        if frame_counter - tr["last_seen"] <= TRACK_TTL_FRAMES:
+            new_tracks[tid] = tr
+
+    tracks.clear()
+    tracks.update(new_tracks)
+    return [(tid, tr["box"]) for tid, tr in tracks.items()
+            if tr["last_seen"] == frame_counter]
 
 
 def ocr_worker():
@@ -93,8 +213,10 @@ def ocr_worker():
                 (int(min(xs) * inv), int(min(ys) * inv)),
                 (int(max(xs) * inv), int(max(ys) * inv)),
             ))
+        grouped = group_boxes(boxes)
+        active = update_tracks(frame, grouped)
         with detections_lock:
-            latest_detections[:] = group_boxes(boxes)
+            latest_tracks[:] = active
 
 
 worker = threading.Thread(target=ocr_worker, daemon=True)
@@ -113,10 +235,12 @@ try:
             latest_frame = frame
 
         with detections_lock:
-            detections = list(latest_detections)
+            active = list(latest_tracks)
 
-        for pt1, pt2 in detections:
+        for tid, (pt1, pt2) in active:
             cv2.rectangle(frame, pt1, pt2, (0, 255, 0), 2)
+            cv2.putText(frame, f"#{tid}", (pt1[0], max(pt1[1] - 6, 16)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
 
         cv2.imshow("screen-ocr", frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
