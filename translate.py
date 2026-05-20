@@ -1,28 +1,52 @@
+import os
 import threading
-import torch
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
-MODEL_NAME = "facebook/nllb-200-distilled-600M"
-SRC_LANG = "kor_Hang"
-TGT_LANG = "eng_Latn"
-MAX_NEW_TOKENS = 128
+os.environ.setdefault(
+    "HF_HOME",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), ".hf_cache"),
+)
+
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+
+MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"
+MAX_NEW_TOKENS = 256
+
+SYSTEM_PROMPT = (
+    "You are a translator. Translate Korean text to natural English.\n"
+    "Context: the source is a wuxia/xianxia webnovel or manhwa, with martial sects, cultivators, and honorifics.\n"
+    "Rules:\n"
+    "- Output ONLY the English translation. No explanations, no quotes, no romanization.\n"
+    "- Preserve proper nouns naturally (e.g., 화산파 -> Mount Hua Sect, not 'volcano sect').\n"
+    "- Keep honorifics where they read naturally in English (Master, Senior Brother, etc.).\n"
+    "- If the input is a single short label (UI text), translate concisely."
+)
 
 _lock = threading.Lock()
 _tokenizer = None
 _model = None
 _device = None
-_tgt_token_id = None
 
 
 def _load():
-    global _tokenizer, _model, _device, _tgt_token_id
+    global _tokenizer, _model, _device
     if _model is not None:
         return
     _device = "cuda" if torch.cuda.is_available() else "cpu"
-    _tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, src_lang=SRC_LANG)
-    _model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME).to(_device)
+    _tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    bnb = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+    )
+    _model = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME,
+        quantization_config=bnb,
+        device_map="auto",
+        use_safetensors=True,
+    )
     _model.eval()
-    _tgt_token_id = _tokenizer.convert_tokens_to_ids(TGT_LANG)
 
 
 def translate(text):
@@ -31,12 +55,21 @@ def translate(text):
         return ""
     with _lock:
         _load()
-        inputs = _tokenizer(text, return_tensors="pt", truncation=True).to(_device)
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": text},
+        ]
+        inputs = _tokenizer.apply_chat_template(
+            messages,
+            return_tensors="pt",
+            add_generation_prompt=True,
+        ).to(_device)
         with torch.no_grad():
             out = _model.generate(
-                **inputs,
-                forced_bos_token_id=_tgt_token_id,
+                inputs,
                 max_new_tokens=MAX_NEW_TOKENS,
-                num_beams=1,
+                do_sample=False,
+                pad_token_id=_tokenizer.eos_token_id,
             )
-        return _tokenizer.batch_decode(out, skip_special_tokens=True)[0]
+        gen = out[0][inputs.shape[1]:]
+        return _tokenizer.decode(gen, skip_special_tokens=True).strip()

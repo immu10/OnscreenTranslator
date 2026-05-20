@@ -3,3 +3,5 @@ numpy
 torch
 easyocr
 dxcam
+transformers
+sentencepiece
