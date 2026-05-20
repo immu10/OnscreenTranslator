@@ -5,3 +5,5 @@ easyocr
 dxcam
 transformers
 sentencepiece
+accelerate
+bitsandbytes
