@@ -1,4 +1,3 @@
-import paddle  # MUST be imported before torch (pybind11 _gpuDeviceProperties conflict)
 import threading
 import queue
 import logging

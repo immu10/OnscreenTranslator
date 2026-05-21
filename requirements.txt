@@ -1,11 +1,19 @@
---extra-index-url https://www.paddlepaddle.org.cn/packages/stable/cu123/
+# Install:
+#   pip install -r requirements.txt
+#   pip uninstall opencv-python-headless -y
+#   pip install opencv-python
+#
+# The last two steps are required because EasyOCR transitively depends on
+# opencv-python-headless. Both packages install a `cv2/` directory at the
+# same path and whichever extracts last wins on disk. We need opencv-python
+# (GUI build, has cv2.imshow), so headless must be removed and the GUI
+# build installed in its place.
+
 --extra-index-url https://download.pytorch.org/whl/cu121
 
-paddlepaddle-gpu==2.6.2
-paddleocr==2.8.1
 torch==2.5.1
+easyocr
 opencv-python
-numpy
 dxcam
 transformers==4.46.3
 sentencepiece
