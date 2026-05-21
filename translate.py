@@ -9,12 +9,31 @@ os.environ.setdefault(
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 
-MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct"
+# Current: 7B + bitsandbytes 4-bit. Slower (~3 tok/s) but uses few-shot examples
+# as guidance rather than copy-paste menu (3B failure mode).
+# Faster swap once autoawq installs: change MODEL_NAME to "Qwen/Qwen2.5-7B-Instruct-AWQ"
+# and switch _load() to the AWQ path (no BitsAndBytesConfig, just torch_dtype=float16).
+MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"
 MAX_NEW_TOKENS = 96
 
 SYSTEM_PROMPT = (
-    "Translate Korean to English. Wuxia/manhwa context "
-    "(e.g. 화산파 = Mount Hua Sect). Output only the translation."
+    "You translate Korean to English. The source is wuxia/xianxia webnovel or manhwa.\n"
+    "RULES:\n"
+    "1. Output ONLY the English translation of the given input. No quotes, no explanation, no romanization.\n"
+    "2. Translate ONLY what is in the input. Do NOT add words, names, or context that are not in the source.\n"
+    "3. If the input is short or fragmentary, give a literal short translation. Do not invent dialogue or guess what the speaker meant.\n"
+    "4. For Korean martial-sect names rendered with Chinese hanja meanings, prefer the standard wuxia rendering (e.g. mountain+sect compounds = 'X Sect').\n"
+    "5. Honorifics: keep when they read naturally (Master, Senior Brother, etc.).\n"
+    "\n"
+    "EXAMPLES:\n"
+    "Korean: 망했다고?\n"
+    "English: It fell?\n"
+    "\n"
+    "Korean: 화산파\n"
+    "English: Mount Hua Sect\n"
+    "\n"
+    "Korean: 사부님!\n"
+    "English: Master!\n"
 )
 
 _lock = threading.Lock()
@@ -75,6 +94,13 @@ def _load():
     print("[translate] model.eval() done; _load() complete", flush=True)
 
 
+def warmup(text="안녕"):
+    """Force model load + one generation pass to pay CUDA kernel JIT cost upfront."""
+    print("[translate] warmup() begin", flush=True)
+    translate(text)
+    print("[translate] warmup() complete", flush=True)
+
+
 def translate(text):
     import time
     text = text.strip()
@@ -115,5 +141,7 @@ def translate(text):
         n_out = gen.shape[0]
         print(f"[translate] in={n_in}tok out={n_out}tok "
               f"tok={t1-t0:.3f}s gen={t2-t1:.3f}s "
-              f"({n_out/(t2-t1):.1f} tok/s) -> {result!r}", flush=True)
+              f"({n_out/(t2-t1):.1f} tok/s)\n"
+              f"           KO: {text!r}\n"
+              f"           EN: {result!r}", flush=True)
         return result

@@ -19,3 +19,4 @@ transformers==4.46.3
 sentencepiece
 accelerate==1.1.1
 bitsandbytes==0.43.3
+# autoawq  # uncomment + swap translate.py if you get this installing on Windows

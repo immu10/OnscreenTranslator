@@ -14,6 +14,12 @@ if (-not (Test-Path "logs")) {
 $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $log = "logs\run-$stamp.log"
 
+# Force UTF-8 everywhere so Korean chars don't crash print() on Windows
+$env:PYTHONIOENCODING = "utf-8"
+$env:PYTHONUTF8 = "1"
+chcp 65001 > $null
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+
 cmd /c "python -u main.py 2>&1" | ForEach-Object {
     "{0} {1}" -f (Get-Date -Format "HH:mm:ss.fff"), $_
 } | Tee-Object -FilePath $log
