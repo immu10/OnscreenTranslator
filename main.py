@@ -1,9 +1,10 @@
+import paddle  # MUST be imported before torch (pybind11 _gpuDeviceProperties conflict)
 import threading
 import queue
 import logging
 import cv2
 import torch
-import easyocr
+import ocr as ocr_backend
 from translate import translate
 from stream import Stream
 
@@ -95,7 +96,6 @@ def iou(a, b):
 cuda_ok = torch.cuda.is_available()
 print(f"CUDA available: {cuda_ok}"
       + (f" ({torch.cuda.get_device_name(0)})" if cuda_ok else ""))
-reader = easyocr.Reader(['ko', 'en'], gpu=cuda_ok)
 
 latest_frame = None
 latest_frame_lock = threading.Lock()
@@ -120,20 +120,13 @@ def detector_worker():
         fh, fw = frame.shape[:2]
         scale = OCR_HEIGHT / fh
         small = cv2.resize(frame, (int(fw * scale), OCR_HEIGHT))
-        horizontal_list, free_list = reader.detect(small)
+        small_boxes = ocr_backend.detect(small)
         inv = 1.0 / scale
         raw = []
-        for x_min, x_max, y_min, y_max in horizontal_list[0]:
+        for (x1, y1), (x2, y2) in small_boxes:
             raw.append((
-                (int(x_min * inv), int(y_min * inv)),
-                (int(x_max * inv), int(y_max * inv)),
-            ))
-        for quad in free_list[0]:
-            xs = [p[0] for p in quad]
-            ys = [p[1] for p in quad]
-            raw.append((
-                (int(min(xs) * inv), int(min(ys) * inv)),
-                (int(max(xs) * inv), int(max(ys) * inv)),
+                (int(x1 * inv), int(y1 * inv)),
+                (int(x2 * inv), int(y2 * inv)),
             ))
         grouped = group_boxes(raw)
 
@@ -185,10 +178,12 @@ def ocr_worker():
             continue
         try:
             try:
-                r = reader.readtext(crop, detail=0, paragraph=True)
-                text = " ".join(r).strip()
+                if OCR_UPSCALE and OCR_UPSCALE != 1.0:
+                    crop = cv2.resize(crop, None, fx=OCR_UPSCALE, fy=OCR_UPSCALE,
+                                      interpolation=cv2.INTER_CUBIC)
+                text = ocr_backend.recognize(crop)
             except Exception:
-                box_log.exception("ocr readtext failed")
+                box_log.exception("ocr recognize failed")
                 text = ""
             if not text:
                 continue

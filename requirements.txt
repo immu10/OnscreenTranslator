@@ -1,9 +1,13 @@
+--extra-index-url https://www.paddlepaddle.org.cn/packages/stable/cu123/
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+paddlepaddle-gpu==2.6.2
+paddleocr==2.8.1
+torch==2.5.1
 opencv-python
 numpy
-torch
-easyocr
 dxcam
-transformers
+transformers==4.46.3
 sentencepiece
-accelerate
-bitsandbytes
+accelerate==1.1.1
+bitsandbytes==0.43.3
