@@ -177,9 +177,12 @@ def ocr_worker():
             continue
         try:
             try:
-                if OCR_UPSCALE and OCR_UPSCALE != 1.0:
-                    crop = cv2.resize(crop, None, fx=OCR_UPSCALE, fy=OCR_UPSCALE,
-                                      interpolation=cv2.INTER_CUBIC)
+                # Disabled for performance; uncomment if OCR is making mistakes
+                # on small text (helps recognizer when glyphs are below its
+                # trained size range).
+                # if OCR_UPSCALE and OCR_UPSCALE != 1.0:
+                #     crop = cv2.resize(crop, None, fx=OCR_UPSCALE, fy=OCR_UPSCALE,
+                #                       interpolation=cv2.INTER_CUBIC)
                 text = ocr_backend.recognize(crop)
             except Exception:
                 box_log.exception("ocr recognize failed")
@@ -225,7 +228,8 @@ ocr_thread.start()
 
 cv2.namedWindow("screen-ocr", cv2.WINDOW_NORMAL)
 
-stream = Stream(monitor=MONITOR_INDEX, target_fps=TARGET_FPS)
+stream = Stream(monitor=MONITOR_INDEX, target_fps=TARGET_FPS,
+                crop_top_ratio=0.1, crop_bottom_ratio=0.1)
 stream.start()
 
 try:

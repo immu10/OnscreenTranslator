@@ -9,17 +9,12 @@ os.environ.setdefault(
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 
-MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"
-MAX_NEW_TOKENS = 256
+MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct"
+MAX_NEW_TOKENS = 96
 
 SYSTEM_PROMPT = (
-    "You are a translator. Translate Korean text to natural English.\n"
-    "Context: the source is a wuxia/xianxia webnovel or manhwa, with martial sects, cultivators, and honorifics.\n"
-    "Rules:\n"
-    "- Output ONLY the English translation. No explanations, no quotes, no romanization.\n"
-    "- Preserve proper nouns naturally (e.g., 화산파 -> Mount Hua Sect, not 'volcano sect').\n"
-    "- Keep honorifics where they read naturally in English (Master, Senior Brother, etc.).\n"
-    "- If the input is a single short label (UI text), translate concisely."
+    "Translate Korean to English. Wuxia/manhwa context "
+    "(e.g. 화산파 = Mount Hua Sect). Output only the translation."
 )
 
 _lock = threading.Lock()
@@ -81,32 +76,44 @@ def _load():
 
 
 def translate(text):
+    import time
     text = text.strip()
     if not text:
         return ""
-    print(f"[translate] translate() called text={text!r}", flush=True)
     with _lock:
         _load()
-        print("[translate] applying chat template ...", flush=True)
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": text},
         ]
-        inputs = _tokenizer.apply_chat_template(
+        t0 = time.perf_counter()
+        enc = _tokenizer.apply_chat_template(
             messages,
             return_tensors="pt",
             add_generation_prompt=True,
-        ).to(_device)
-        print(f"[translate] inputs ready shape={tuple(inputs.shape)} -> generate()", flush=True)
+            return_dict=True,
+        )
+        input_ids = enc["input_ids"].to(_device)
+        attention_mask = enc["attention_mask"].to(_device)
+        t1 = time.perf_counter()
         with torch.no_grad():
             out = _model.generate(
-                inputs,
+                input_ids,
+                attention_mask=attention_mask,
                 max_new_tokens=MAX_NEW_TOKENS,
                 do_sample=False,
+                temperature=None,
+                top_p=None,
+                top_k=None,
                 pad_token_id=_tokenizer.eos_token_id,
             )
-        print(f"[translate] generate() done out_shape={tuple(out.shape)}", flush=True)
-        gen = out[0][inputs.shape[1]:]
+        torch.cuda.synchronize() if _device == "cuda" else None
+        t2 = time.perf_counter()
+        gen = out[0][input_ids.shape[1]:]
         result = _tokenizer.decode(gen, skip_special_tokens=True).strip()
-        print(f"[translate] decoded result={result!r}", flush=True)
+        n_in = input_ids.shape[1]
+        n_out = gen.shape[0]
+        print(f"[translate] in={n_in}tok out={n_out}tok "
+              f"tok={t1-t0:.3f}s gen={t2-t1:.3f}s "
+              f"({n_out/(t2-t1):.1f} tok/s) -> {result!r}", flush=True)
         return result
