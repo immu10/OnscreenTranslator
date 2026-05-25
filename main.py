@@ -48,16 +48,6 @@ class DropOldestQueue:
         with self._cond:
             return len(self._dq)
 
-logging.basicConfig(
-    filename="boxID.log",
-    filemode="w",
-    level=logging.INFO,
-    format="%(asctime)s %(message)s",
-)
-for noisy in ("httpx", "httpcore", "urllib3", "huggingface_hub",
-              "transformers", "filelock"):
-    logging.getLogger(noisy).setLevel(logging.WARNING)
-box_log = logging.getLogger("boxID")
 
 MONITOR_INDEX = 1
 TARGET_FPS = 60
@@ -133,10 +123,7 @@ def iou(a, b):
     return inter / (aa + bb - inter)
 
 
-cuda_ok = torch.cuda.is_available()
-print(f"CUDA available: {cuda_ok}"
-      + (f" ({torch.cuda.get_device_name(0)})" if cuda_ok else ""))
-
+# Shared state — populated by main(), read by the worker threads.
 latest_frame = None
 latest_frame_lock = threading.Lock()
 stop_event = threading.Event()
@@ -148,6 +135,8 @@ translation_cache = {}
 translation_cache_lock = threading.Lock()
 
 ocr_queue = DropOldestQueue(maxsize=4)
+
+box_log = None  # initialized in main()
 
 
 def detector_worker():
@@ -278,74 +267,100 @@ def ocr_worker():
             box_log.exception("ocr_worker loop error")
 
 
-print("[main] pre-warming translation model ...", flush=True)
-_warm_t0 = _t()
-warmup()
-print(f"[main] warmup done in {_ms(_warm_t0, _t())/1000:.1f}s", flush=True)
+def setup_logging():
+    global box_log
+    logging.basicConfig(
+        filename="boxID.log",
+        filemode="w",
+        level=logging.INFO,
+        format="%(asctime)s %(message)s",
+    )
+    for noisy in ("httpx", "httpcore", "urllib3", "huggingface_hub",
+                  "transformers", "filelock"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+    box_log = logging.getLogger("boxID")
 
-detector_thread = threading.Thread(target=detector_worker, daemon=True)
-detector_thread.start()
-ocr_thread = threading.Thread(target=ocr_worker, daemon=True)
-ocr_thread.start()
 
-cv2.namedWindow("screen-ocr", cv2.WINDOW_NORMAL)
+def main():
+    global latest_frame
 
-stream = Stream(monitor=MONITOR_INDEX, target_fps=TARGET_FPS,
-                crop_top_ratio=0.1, crop_bottom_ratio=0.1)
-stream.start()
+    setup_logging()
 
-main_iter = 0
-main_last_report = _t()
-main_acc = {"get": 0.0, "draw": 0.0, "show": 0.0, "n": 0}
+    cuda_ok = torch.cuda.is_available()
+    print(f"CUDA available: {cuda_ok}"
+          + (f" ({torch.cuda.get_device_name(0)})" if cuda_ok else ""))
 
-try:
-    while True:
-        t0 = _t()
-        frame = stream.get_frame()
-        t_get = _t()
+    print("[main] pre-warming translation model ...", flush=True)
+    warm_t0 = _t()
+    warmup()
+    print(f"[main] warmup done in {_ms(warm_t0, _t())/1000:.1f}s", flush=True)
 
-        with latest_frame_lock:
-            latest_frame = frame
+    detector_thread = threading.Thread(target=detector_worker, daemon=True)
+    detector_thread.start()
+    ocr_thread = threading.Thread(target=ocr_worker, daemon=True)
+    ocr_thread.start()
 
-        display = frame.copy()
+    cv2.namedWindow("screen-ocr", cv2.WINDOW_NORMAL)
 
-        with results_lock:
-            snapshot = list(results)
+    stream = Stream(monitor=MONITOR_INDEX, target_fps=TARGET_FPS,
+                    crop_top_ratio=0.1, crop_bottom_ratio=0.1)
+    stream.start()
 
-        for box, text, trans in snapshot:
-            (pt1, pt2) = box
-            cv2.rectangle(display, pt1, pt2, (0, 255, 0), 2)
-            label = trans or text
-            if label:
-                cv2.putText(display, label, (pt1[0], max(pt1[1] - 6, 16)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
-        t_draw = _t()
+    main_last_report = _t()
+    main_acc = {"get": 0.0, "draw": 0.0, "show": 0.0, "n": 0}
 
-        cv2.imshow("screen-ocr", display)
-        key = cv2.waitKey(1) & 0xFF
-        t_show = _t()
+    try:
+        while True:
+            t0 = _t()
+            frame = stream.get_frame()
+            t_get = _t()
 
-        main_acc["get"] += _ms(t0, t_get)
-        main_acc["draw"] += _ms(t_get, t_draw)
-        main_acc["show"] += _ms(t_draw, t_show)
-        main_acc["n"] += 1
-        main_iter += 1
-        if t_show - main_last_report >= 2.0:
-            n = max(1, main_acc["n"])
-            print(f"[main] last {n} frames avg: "
-                  f"get={main_acc['get']/n:5.1f}ms "
-                  f"draw={main_acc['draw']/n:5.1f}ms "
-                  f"show+wait={main_acc['show']/n:5.1f}ms "
-                  f"boxes={len(snapshot):2d}",
-                  flush=True)
-            main_acc = {"get": 0.0, "draw": 0.0, "show": 0.0, "n": 0}
-            main_last_report = t_show
+            with latest_frame_lock:
+                latest_frame = frame
 
-        if key == ord('q'):
-            break
-finally:
-    stream.stop()
-    stop_event.set()
-    detector_thread.join(timeout=1.0)
-    ocr_thread.join(timeout=1.0)
-    cv2.destroyAllWindows()
+            display = frame.copy()
+
+            with results_lock:
+                snapshot = list(results)
+
+            for box, text, trans in snapshot:
+                (pt1, pt2) = box
+                cv2.rectangle(display, pt1, pt2, (0, 255, 0), 2)
+                label = trans or text
+                if label:
+                    cv2.putText(display, label, (pt1[0], max(pt1[1] - 6, 16)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2,
+                                cv2.LINE_AA)
+            t_draw = _t()
+
+            cv2.imshow("screen-ocr", display)
+            key = cv2.waitKey(1) & 0xFF
+            t_show = _t()
+
+            main_acc["get"] += _ms(t0, t_get)
+            main_acc["draw"] += _ms(t_get, t_draw)
+            main_acc["show"] += _ms(t_draw, t_show)
+            main_acc["n"] += 1
+            if t_show - main_last_report >= 2.0:
+                n = max(1, main_acc["n"])
+                print(f"[main] last {n} frames avg: "
+                      f"get={main_acc['get']/n:5.1f}ms "
+                      f"draw={main_acc['draw']/n:5.1f}ms "
+                      f"show+wait={main_acc['show']/n:5.1f}ms "
+                      f"boxes={len(snapshot):2d}",
+                      flush=True)
+                main_acc = {"get": 0.0, "draw": 0.0, "show": 0.0, "n": 0}
+                main_last_report = t_show
+
+            if key == ord('q'):
+                break
+    finally:
+        stream.stop()
+        stop_event.set()
+        detector_thread.join(timeout=1.0)
+        ocr_thread.join(timeout=1.0)
+        cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
