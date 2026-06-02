@@ -15,6 +15,7 @@ torch==2.5.1
 easyocr
 opencv-python
 dxcam
+PyQt6
 transformers==4.46.3
 sentencepiece
 accelerate==1.1.1

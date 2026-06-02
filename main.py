@@ -8,6 +8,9 @@ import torch
 import ocr as ocr_backend
 from translate import translate, warmup
 from stream import Stream
+# ui (PyQt6) is imported lazily inside main() AFTER model warmup to avoid
+# Qt's graphics plugin grabbing GPU context before bitsandbytes finishes
+# loading Qwen — that conflict silently crashes bnb on Windows.
 
 
 def _t():
@@ -140,6 +143,7 @@ box_log = None  # initialized in main()
 
 
 def detector_worker():
+    prev_thumb = None
     while not stop_event.is_set():
         with latest_frame_lock:
             frame = None if latest_frame is None else latest_frame.copy()
@@ -148,6 +152,17 @@ def detector_worker():
             continue
 
         fh, fw = frame.shape[:2]
+
+        # Same-frame check: if the screen hasn't meaningfully changed since the
+        # last iteration, skip detection entirely and leave results untouched.
+        # Cheap thumbnail diff (32x32 grayscale, max-pixel-diff threshold).
+        thumb = cv2.cvtColor(cv2.resize(frame, (32, 32)), cv2.COLOR_BGR2GRAY)
+        if prev_thumb is not None:
+            if int(cv2.absdiff(thumb, prev_thumb).max()) < 5:
+                stop_event.wait(0.05)  # static frame, don't burn the GPU
+                continue
+        prev_thumb = thumb
+
         scale = OCR_HEIGHT / fh
         small = cv2.resize(frame, (int(fw * scale), OCR_HEIGHT))
 
@@ -281,9 +296,26 @@ def setup_logging():
     box_log = logging.getLogger("boxID")
 
 
-def main():
+def capture_worker(stream):
+    """Continuously pulls frames from the screen stream and publishes the
+    latest one to `latest_frame` for the detector to consume."""
     global latest_frame
+    while not stop_event.is_set():
+        frame = stream.get_frame()
+        if frame is None:
+            stop_event.wait(0.005)
+            continue
+        with latest_frame_lock:
+            latest_frame = frame
 
+
+def get_results_snapshot():
+    """Thread-safe accessor for the UI's QTimer to pull current results."""
+    with results_lock:
+        return list(results)
+
+
+def main():
     setup_logging()
 
     cuda_ok = torch.cuda.is_available()
@@ -295,68 +327,36 @@ def main():
     warmup()
     print(f"[main] warmup done in {_ms(warm_t0, _t())/1000:.1f}s", flush=True)
 
-    detector_thread = threading.Thread(target=detector_worker, daemon=True)
-    detector_thread.start()
-    ocr_thread = threading.Thread(target=ocr_worker, daemon=True)
-    ocr_thread.start()
-
-    cv2.namedWindow("screen-ocr", cv2.WINDOW_NORMAL)
+    # Import PyQt6 only AFTER the LLM is fully loaded in VRAM, otherwise
+    # Qt's graphics plugin init can crash bitsandbytes silently on Windows.
+    import ui
 
     stream = Stream(monitor=MONITOR_INDEX, target_fps=TARGET_FPS,
                     crop_top_ratio=0.1, crop_bottom_ratio=0.1)
     stream.start()
 
-    main_last_report = _t()
-    main_acc = {"get": 0.0, "draw": 0.0, "show": 0.0, "n": 0}
+    capture_thread = threading.Thread(
+        target=capture_worker, args=(stream,), daemon=True
+    )
+    capture_thread.start()
+    detector_thread = threading.Thread(target=detector_worker, daemon=True)
+    detector_thread.start()
+    ocr_thread = threading.Thread(target=ocr_worker, daemon=True)
+    ocr_thread.start()
 
     try:
-        while True:
-            t0 = _t()
-            frame = stream.get_frame()
-            t_get = _t()
-
-            with latest_frame_lock:
-                latest_frame = frame
-
-            display = frame.copy()
-
-            with results_lock:
-                snapshot = list(results)
-
-            for box, text, trans in snapshot:
-                (pt1, pt2) = box
-                cv2.rectangle(display, pt1, pt2, (0, 255, 0), 2)
-                label = trans or text
-                if label:
-                    cv2.putText(display, label, (pt1[0], max(pt1[1] - 6, 16)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2,
-                                cv2.LINE_AA)
-            t_draw = _t()
-
-            cv2.imshow("screen-ocr", display)
-            key = cv2.waitKey(1) & 0xFF
-            t_show = _t()
-
-            main_acc["get"] += _ms(t0, t_get)
-            main_acc["draw"] += _ms(t_get, t_draw)
-            main_acc["show"] += _ms(t_draw, t_show)
-            main_acc["n"] += 1
-            if t_show - main_last_report >= 2.0:
-                n = max(1, main_acc["n"])
-                print(f"[main] last {n} frames avg: "
-                      f"get={main_acc['get']/n:5.1f}ms "
-                      f"draw={main_acc['draw']/n:5.1f}ms "
-                      f"show+wait={main_acc['show']/n:5.1f}ms "
-                      f"boxes={len(snapshot):2d}",
-                      flush=True)
-                main_acc = {"get": 0.0, "draw": 0.0, "show": 0.0, "n": 0}
-                main_last_report = t_show
-
-            if key == ord('q'):
-                break
+        # Qt event loop runs on the main thread; blocks until window closes
+        # or stop_event is set by another thread.
+        ui.run(
+            monitor_index=MONITOR_INDEX,
+            region=stream.region,
+            results_getter=get_results_snapshot,
+            stop_event=stop_event,
+        )
     finally:
-        stream.stop()
         stop_event.set()
+        stream.stop()
+        capture_thread.join(timeout=1.0)
         detector_thread.join(timeout=1.0)
         ocr_thread.join(timeout=1.0)
         cv2.destroyAllWindows()

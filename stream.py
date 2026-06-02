@@ -9,20 +9,22 @@ class Stream:
         self.color = color
         self.crop_top_ratio = crop_top_ratio
         self.crop_bottom_ratio = crop_bottom_ratio
+        self.region = None  # (x1, y1, x2, y2) in monitor-local coords; set in start()
         self._camera = None
 
     def start(self):
         self._camera = dxcam.create(output_idx=self.monitor, output_color=self.color)
         w, h = self._camera.width, self._camera.height
-        region = None
         if self.crop_top_ratio > 0 or self.crop_bottom_ratio > 0:
             y_top = int(h * self.crop_top_ratio)
             y_bot = h - int(h * self.crop_bottom_ratio)
-            region = (0, y_top, w, y_bot)
+            self.region = (0, y_top, w, y_bot)
             print(f"[stream] cropping top {self.crop_top_ratio:.0%} "
-                  f"bottom {self.crop_bottom_ratio:.0%} -> region={region}",
+                  f"bottom {self.crop_bottom_ratio:.0%} -> region={self.region}",
                   flush=True)
-        self._camera.start(target_fps=self.target_fps, video_mode=True, region=region)
+        else:
+            self.region = (0, 0, w, h)
+        self._camera.start(target_fps=self.target_fps, video_mode=True, region=self.region)
 
     def stop(self):
         if self._camera is not None:
