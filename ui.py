@@ -248,6 +248,10 @@ def run(monitor_index, region, results_getter, stop_event, restart_capture=None)
                    returns.
     """
     app = QApplication.instance() or QApplication([])
+    # Don't let Qt quit when the settings dialog closes — only our explicit
+    # quit_app() (tray menu / handle right-click / closeEvent on a real window)
+    # should end the loop.
+    app.setQuitOnLastWindowClosed(False)
 
     screens = app.screens()
     if not screens:
