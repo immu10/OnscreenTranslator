@@ -13,9 +13,15 @@ in *capture-local* coordinates (matching the region the detector sees).
 
 import ctypes
 
-from PyQt6.QtWidgets import QApplication, QWidget, QSystemTrayIcon, QMenu
+from PyQt6.QtWidgets import (
+    QApplication, QWidget, QSystemTrayIcon, QMenu,
+    QPushButton, QVBoxLayout, QLabel,
+)
 from PyQt6.QtCore import Qt, QTimer, QRect
 from PyQt6.QtGui import QPainter, QColor, QFont, QPen, QIcon, QPixmap, QShortcut, QKeySequence
+
+import settings as _settings
+from settings import SettingsDialog, SETTINGS
 
 
 # Win32 SetWindowDisplayAffinity flag: window is visible to user but invisible
@@ -44,7 +50,6 @@ def _exclude_from_capture(widget):
 
 REPAINT_HZ = 30
 LABEL_PAD = 6           # gap between source box and translation label
-FONT_FAMILY = "Malgun Gothic"  # ships with Windows, renders Korean well
 
 
 class Overlay(QWidget):
@@ -80,9 +85,14 @@ class Overlay(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
 
-        outline_pen = QPen(QColor(0, 255, 80, 220), 2)
-        bg_color = QColor(0, 0, 0, 200)
-        text_color = QColor(255, 255, 255, 255)
+        # Live settings — read each paint so changes take effect immediately.
+        outline_pen = QPen(QColor(*SETTINGS["box_color"]), 2)
+        bg_color = QColor(*SETTINGS["bg_color"])
+        text_color = QColor(*SETTINGS["text_color"])
+        show_outline = SETTINGS["show_box_outline"]
+        font_family = SETTINGS["font_family"]
+        font_min = SETTINGS["font_size_min"]
+        font_max = SETTINGS["font_size_max"]
 
         win_w = self.width()
         win_h = self.height()
@@ -95,16 +105,17 @@ class Overlay(QWidget):
                 continue
 
             # Draw box outline (helps see what was detected)
-            painter.setPen(outline_pen)
-            painter.drawRect(x1, y1, box_w, box_h)
+            if show_outline:
+                painter.setPen(outline_pen)
+                painter.drawRect(x1, y1, box_w, box_h)
 
             label = trans or text
             if not label:
                 continue
 
             # Font size scales with box height; clamped to a usable range.
-            font_pt = max(9, min(20, int(box_h * 0.35)))
-            font = QFont(FONT_FAMILY, font_pt)
+            font_pt = max(font_min, min(font_max, int(box_h * 0.35)))
+            font = QFont(font_family, font_pt)
             font.setBold(True)
             painter.setFont(font)
             metrics = painter.fontMetrics()
@@ -152,7 +163,81 @@ class Overlay(QWidget):
             )
 
 
-def run(monitor_index, region, results_getter, stop_event):
+class FloatingButton(QWidget):
+    """Discord-overlay-style floating handle: small always-on-top circle that
+    can be dragged anywhere on screen. Click (or right-click) for a menu with
+    Settings / Quit. No taskbar entry, no alt-tab — just floats."""
+
+    SIZE = 44
+
+    def __init__(self, on_settings, on_quit):
+        super().__init__()
+        self.on_settings = on_settings
+        self.on_quit = on_quit
+        self._drag_offset = None
+        self._dragged = False
+
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool                # no taskbar, no alt-tab
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setFixedSize(self.SIZE, self.SIZE)
+
+        # Default position: top-right of primary screen, just below corner.
+        primary = QApplication.primaryScreen().geometry()
+        self.move(primary.x() + primary.width() - self.SIZE - 24,
+                  primary.y() + 24)
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+
+        # Translucent dark fill, accent ring.
+        p.setBrush(QColor(20, 20, 20, 210))
+        p.setPen(QPen(QColor(0, 200, 80, 230), 2))
+        p.drawEllipse(2, 2, self.SIZE - 4, self.SIZE - 4)
+
+        # 'T' glyph in the center.
+        p.setPen(QColor(255, 255, 255, 240))
+        f = QFont("Segoe UI", 16)
+        f.setBold(True)
+        p.setFont(f)
+        p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "T")
+
+    def _show_menu(self, global_pos):
+        menu = QMenu(self)
+        menu.addAction("Settings...").triggered.connect(self.on_settings)
+        menu.addSeparator()
+        menu.addAction("Quit").triggered.connect(self.on_quit)
+        menu.exec(global_pos)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._drag_offset = e.globalPosition().toPoint() - self.pos()
+            self._dragged = False
+        elif e.button() == Qt.MouseButton.RightButton:
+            self._show_menu(e.globalPosition().toPoint())
+
+    def mouseMoveEvent(self, e):
+        if self._drag_offset is not None:
+            new_pos = e.globalPosition().toPoint() - self._drag_offset
+            self.move(new_pos)
+            self._dragged = True
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            if not self._dragged:
+                # treat as a click → open menu at cursor
+                self._show_menu(e.globalPosition().toPoint())
+            self._drag_offset = None
+            self._dragged = False
+
+
+def run(monitor_index, region, results_getter, stop_event, restart_capture=None):
     """Blocks until stop_event is set or the Qt app quits.
 
     monitor_index: which screen the overlay covers (matches dxcam.output_idx).
@@ -185,22 +270,75 @@ def run(monitor_index, region, results_getter, stop_event):
     overlay.show()
     _exclude_from_capture(overlay)
 
+    refs = {}  # hold strong refs so dialogs/icons aren't garbage-collected
+
     def quit_app():
         stop_event.set()
         app.quit()
 
-    # System tray icon: right-click for menu, always-on affordance to close.
+    def reposition_overlay():
+        """Move the overlay to match the current settings' monitor + region."""
+        mi = SETTINGS["monitor_index"]
+        screens_now = app.screens()
+        if not screens_now:
+            return
+        scr = screens_now[mi] if 0 <= mi < len(screens_now) else screens_now[0]
+        sg2 = scr.geometry()
+        new_region = getattr(reposition_overlay, "_region", None)
+        if new_region is None:
+            return
+        rx1, ry1, rx2, ry2 = new_region
+        overlay.setGeometry(
+            sg2.x() + rx1, sg2.y() + ry1, rx2 - rx1, ry2 - ry1,
+        )
+        # Re-apply capture exclusion since the HWND may have been re-realized.
+        _exclude_from_capture(overlay)
+        print(f"[ui] overlay moved to monitor #{mi} "
+              f"at ({sg2.x()+rx1},{sg2.y()+ry1}) "
+              f"size ({rx2-rx1}x{ry2-ry1})", flush=True)
+
+    def on_settings_applied():
+        """Called after the user clicks Save in SettingsDialog."""
+        if restart_capture is None:
+            return
+        new_region = restart_capture(
+            SETTINGS["monitor_index"],
+            SETTINGS["crop_top_ratio"],
+            SETTINGS["crop_bottom_ratio"],
+            SETTINGS.get("custom_region"),
+        )
+        if new_region is not None:
+            reposition_overlay._region = new_region
+            reposition_overlay()
+
+    def open_settings():
+        dlg = SettingsDialog(on_apply=on_settings_applied)
+        refs["settings_dlg"] = dlg
+        dlg.show()
+
+    # Floating handle (Discord-overlay style) — drag to reposition, click for menu.
+    handle = FloatingButton(on_settings=open_settings, on_quit=quit_app)
+    _exclude_from_capture(handle)
+    handle.show()
+    refs["handle"] = handle
+
+    # System tray icon — secondary affordance in case the handle is hidden behind
+    # a full-screen window or accidentally dragged off-screen.
     tray = QSystemTrayIcon()
     pix = QPixmap(16, 16)
     pix.fill(QColor(0, 200, 80))
     tray.setIcon(QIcon(pix))
-    tray.setToolTip("Korean OCR Translator — right-click to quit")
+    tray.setToolTip("Korean OCR Translator — right-click to open menu")
     tray_menu = QMenu()
+    tray_menu.addAction("Settings...").triggered.connect(open_settings)
+    tray_menu.addSeparator()
+    tray_menu.addAction("Show handle").triggered.connect(
+        lambda: (handle.show(), handle.raise_())
+    )
     tray_menu.addAction("Quit").triggered.connect(quit_app)
     tray.setContextMenu(tray_menu)
     tray.show()
-    # Keep a reference to tray so it doesn't get GC'd (would hide the icon).
-    overlay._tray = tray
+    refs["tray"] = tray
 
     # Esc as a backup quit hotkey (works while overlay is the focused window —
     # since it's click-through, focus rarely lands on it, so tray is primary).

@@ -6,6 +6,7 @@ import time
 import cv2
 import torch
 import ocr as ocr_backend
+import settings
 from translate import translate, warmup
 from stream import Stream
 # ui (PyQt6) is imported lazily inside main() AFTER model warmup to avoid
@@ -52,7 +53,6 @@ class DropOldestQueue:
             return len(self._dq)
 
 
-MONITOR_INDEX = 1
 TARGET_FPS = 60
 OCR_HEIGHT = 720
 X_GAP_RATIO = 0.8
@@ -60,7 +60,7 @@ Y_GAP_RATIO = 0.4
 IOU_CARRY_THRESHOLD = 0.5
 MIN_BOX_W = 16
 MIN_BOX_H = 10
-OCR_UPSCALE = 2.0
+# OCR_UPSCALE / MONITOR_INDEX / crop ratios are now in settings.SETTINGS.
 
 
 def group_boxes(boxes):
@@ -223,8 +223,9 @@ def ocr_worker():
         t_pop = _t()
         try:
             try:
-                if OCR_UPSCALE and OCR_UPSCALE != 1.0:
-                    crop = cv2.resize(crop, None, fx=OCR_UPSCALE, fy=OCR_UPSCALE,
+                upscale = settings.SETTINGS.get("ocr_upscale", 1.0)
+                if upscale and upscale != 1.0:
+                    crop = cv2.resize(crop, None, fx=upscale, fy=upscale,
                                       interpolation=cv2.INTER_CUBIC)
                 text = ocr_backend.recognize(crop)
             except Exception:
@@ -301,7 +302,13 @@ def capture_worker(stream):
     latest one to `latest_frame` for the detector to consume."""
     global latest_frame
     while not stop_event.is_set():
-        frame = stream.get_frame()
+        try:
+            frame = stream.get_frame()
+        except Exception as e:
+            print(f"[capture] get_frame error: {type(e).__name__}: {e}",
+                  flush=True)
+            stop_event.wait(0.1)
+            continue
         if frame is None:
             stop_event.wait(0.005)
             continue
@@ -317,6 +324,7 @@ def get_results_snapshot():
 
 def main():
     setup_logging()
+    settings.load()
 
     cuda_ok = torch.cuda.is_available()
     print(f"CUDA available: {cuda_ok}"
@@ -331,8 +339,14 @@ def main():
     # Qt's graphics plugin init can crash bitsandbytes silently on Windows.
     import ui
 
-    stream = Stream(monitor=MONITOR_INDEX, target_fps=TARGET_FPS,
-                    crop_top_ratio=0.1, crop_bottom_ratio=0.1)
+    monitor_index = settings.SETTINGS["monitor_index"]
+    stream = Stream(
+        monitor=monitor_index,
+        target_fps=TARGET_FPS,
+        crop_top_ratio=settings.SETTINGS["crop_top_ratio"],
+        crop_bottom_ratio=settings.SETTINGS["crop_bottom_ratio"],
+        custom_region=settings.SETTINGS.get("custom_region"),
+    )
     stream.start()
 
     capture_thread = threading.Thread(
@@ -347,11 +361,36 @@ def main():
     try:
         # Qt event loop runs on the main thread; blocks until window closes
         # or stop_event is set by another thread.
+        def restart_capture(new_monitor, new_top, new_bot,
+                            new_custom_region=...):
+            """Called from the Qt thread when settings change capture params.
+            Stops the current dxcam stream and starts a new one in place.
+            Workers keep running; capture_worker sees None briefly during the
+            swap and resumes once the new stream produces frames.
+
+            Pass new_custom_region=... (Ellipsis) to leave custom_region as-is;
+            pass None explicitly to clear it; pass a 4-tuple to set it."""
+            try:
+                print(f"[main] reconfiguring capture: monitor={new_monitor} "
+                      f"top={new_top} bottom={new_bot} "
+                      f"region={new_custom_region}", flush=True)
+                new_region = stream.reconfigure(
+                    monitor=new_monitor,
+                    crop_top_ratio=new_top,
+                    crop_bottom_ratio=new_bot,
+                    custom_region=new_custom_region,
+                )
+                return new_region
+            except Exception as e:
+                print(f"[main] restart_capture failed: {e}", flush=True)
+                return None
+
         ui.run(
-            monitor_index=MONITOR_INDEX,
+            monitor_index=monitor_index,
             region=stream.region,
             results_getter=get_results_snapshot,
             stop_event=stop_event,
+            restart_capture=restart_capture,
         )
     finally:
         stop_event.set()

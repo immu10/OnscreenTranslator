@@ -15,3 +15,5 @@ env/
 *.png
 tessdata/
 .hf_cache/
+settings.json
+logs/
