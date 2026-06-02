@@ -21,6 +21,7 @@ from PyQt6.QtCore import Qt, QTimer, QRect
 from PyQt6.QtGui import QPainter, QColor, QFont, QPen, QIcon, QPixmap, QShortcut, QKeySequence
 
 from .settings import SettingsDialog, SETTINGS
+from .logs import open_logs
 
 
 # Win32 SetWindowDisplayAffinity flag: window is visible to user but invisible
@@ -169,9 +170,10 @@ class FloatingButton(QWidget):
 
     SIZE = 44
 
-    def __init__(self, on_settings, on_quit):
+    def __init__(self, on_settings, on_logs, on_quit):
         super().__init__()
         self.on_settings = on_settings
+        self.on_logs = on_logs
         self.on_quit = on_quit
         self._drag_offset = None
         self._dragged = False
@@ -210,6 +212,7 @@ class FloatingButton(QWidget):
     def _show_menu(self, global_pos):
         menu = QMenu(self)
         menu.addAction("Settings...").triggered.connect(self.on_settings)
+        menu.addAction("Logs...").triggered.connect(self.on_logs)
         menu.addSeparator()
         menu.addAction("Quit").triggered.connect(self.on_quit)
         menu.exec(global_pos)
@@ -319,8 +322,13 @@ def run(monitor_index, region, results_getter, stop_event, restart_capture=None)
         refs["settings_dlg"] = dlg
         dlg.show()
 
+    def open_log_viewer():
+        refs["log_dlg"] = open_logs()
+
     # Floating handle (Discord-overlay style) — drag to reposition, click for menu.
-    handle = FloatingButton(on_settings=open_settings, on_quit=quit_app)
+    handle = FloatingButton(
+        on_settings=open_settings, on_logs=open_log_viewer, on_quit=quit_app,
+    )
     _exclude_from_capture(handle)
     handle.show()
     refs["handle"] = handle
@@ -334,6 +342,7 @@ def run(monitor_index, region, results_getter, stop_event, restart_capture=None)
     tray.setToolTip("Korean OCR Translator — right-click to open menu")
     tray_menu = QMenu()
     tray_menu.addAction("Settings...").triggered.connect(open_settings)
+    tray_menu.addAction("Logs...").triggered.connect(open_log_viewer)
     tray_menu.addSeparator()
     tray_menu.addAction("Show handle").triggered.connect(
         lambda: (handle.show(), handle.raise_())

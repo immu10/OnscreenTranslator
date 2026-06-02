@@ -2,7 +2,7 @@
 
 Module-level `SETTINGS` dict is the live source of truth — both ui.py and
 ocr_worker read from it on every iteration, so changes made through the
-SettingsDialog take effect immediately (except where labeled "(restart)").
+SettingsDialog take effect immediately (except if and where labeled "(restart)").
 """
 
 import ctypes

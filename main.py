@@ -5,10 +5,13 @@ import logging
 import time
 import cv2
 import torch
+from ui.logs import install_tap
+install_tap()
+
 from text import ocr as ocr_backend
 from text.translate import translate, warmup
 from ui import settings
-from stream import Stream
+from screen import Stream
 # ui (PyQt6) is imported lazily inside main() AFTER model warmup to avoid
 # Qt's graphics plugin grabbing GPU context before bitsandbytes finishes
 # loading Qwen — that conflict silently crashes bnb on Windows.
