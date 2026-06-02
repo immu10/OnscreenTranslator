@@ -20,8 +20,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTimer, QRect
 from PyQt6.QtGui import QPainter, QColor, QFont, QPen, QIcon, QPixmap, QShortcut, QKeySequence
 
-import settings as _settings
-from settings import SettingsDialog, SETTINGS
+from .settings import SettingsDialog, SETTINGS
 
 
 # Win32 SetWindowDisplayAffinity flag: window is visible to user but invisible

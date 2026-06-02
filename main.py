@@ -5,9 +5,9 @@ import logging
 import time
 import cv2
 import torch
-import ocr as ocr_backend
-import settings
-from translate import translate, warmup
+from text import ocr as ocr_backend
+from text.translate import translate, warmup
+from ui import settings
 from stream import Stream
 # ui (PyQt6) is imported lazily inside main() AFTER model warmup to avoid
 # Qt's graphics plugin grabbing GPU context before bitsandbytes finishes
