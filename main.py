@@ -1,3 +1,5 @@
+import ctypes
+import os
 import threading
 import queue
 import collections
@@ -6,6 +8,8 @@ import time
 import cv2
 import torch
 from ui.logs import install_tap
+from paths import app_dir
+from ui.splash import run_with_splash
 install_tap()
 
 from text import ocr as ocr_backend
@@ -133,6 +137,25 @@ def iou(a, b):
 latest_frame = None
 latest_frame_lock = threading.Lock()
 stop_event = threading.Event()
+paused_event = threading.Event()
+
+
+def is_paused():
+    return paused_event.is_set()
+
+
+def toggle_pause():
+    if paused_event.is_set():
+        paused_event.clear()
+        print("[main] resumed", flush=True)
+    else:
+        paused_event.set()
+        # Clear current results so the overlay goes blank immediately.
+        # Detector is blocked while paused, so nothing will repopulate them.
+        with results_lock:
+            results.clear()
+        print("[main] paused (detector + ocr idle; overlay cleared)",
+              flush=True)
 
 results = []
 results_lock = threading.Lock()
@@ -147,7 +170,18 @@ box_log = None  # initialized in main()
 
 def detector_worker():
     prev_thumb = None
+    was_paused = False
     while not stop_event.is_set():
+        if paused_event.is_set():
+            was_paused = True
+            stop_event.wait(0.1)
+            continue
+        if was_paused:
+            # Resuming: drop the cached thumbnail so the same-frame check
+            # doesn't skip the first post-resume detection (the screen looks
+            # identical to before pause but `results` is now empty).
+            prev_thumb = None
+            was_paused = False
         with latest_frame_lock:
             frame = None if latest_frame is None else latest_frame.copy()
         if frame is None:
@@ -210,7 +244,12 @@ def detector_worker():
             new_results.append((box, text, trans))
 
         with results_lock:
-            results[:] = new_results
+            # If the user paused mid-detection, drop this pass's results so
+            # the overlay actually goes blank instead of getting re-populated.
+            if paused_event.is_set():
+                results.clear()
+            else:
+                results[:] = new_results
 
         for box, text, trans in new_results:
             (x1, y1), (x2, y2) = box
@@ -289,7 +328,7 @@ def ocr_worker():
 def setup_logging():
     global box_log
     logging.basicConfig(
-        filename="boxID.log",
+        filename=os.path.join(app_dir(), "boxID.log"),
         filemode="w",
         level=logging.INFO,
         format="%(asctime)s %(message)s",
@@ -325,18 +364,84 @@ def get_results_snapshot():
         return list(results)
 
 
+def _fatal(msg):
+    """Show a native MessageBox and exit. Used before any UI is alive."""
+    print(f"[main] FATAL: {msg}", flush=True)
+    try:
+        ctypes.windll.user32.MessageBoxW(
+            0, msg, "Korean OCR Translator", 0x10,  # MB_ICONERROR
+        )
+    except Exception:
+        pass
+    raise SystemExit(1)
+
+
+def check_gpu():
+    if not torch.cuda.is_available():
+        _fatal(
+            "No CUDA-capable GPU detected.\n\n"
+            "This app needs an NVIDIA GPU with a recent driver (R535+).\n"
+            "AMD/Intel GPUs are not supported in this build."
+        )
+    name = torch.cuda.get_device_name(0)
+    try:
+        free, total = torch.cuda.mem_get_info()
+        gb = total / 1e9
+    except Exception:
+        gb = 0
+    print(f"CUDA available: True ({name}, {gb:.1f}GB)", flush=True)
+    if gb and gb < 7.0:
+        _fatal(
+            f"Detected GPU '{name}' has only {gb:.1f} GB VRAM.\n\n"
+            "Qwen 7B 4-bit needs ~7 GB. Free up VRAM (close other apps) "
+            "or try a smaller model."
+        )
+
+
 def main():
     setup_logging()
     settings.load()
+    check_gpu()
 
-    cuda_ok = torch.cuda.is_available()
-    print(f"CUDA available: {cuda_ok}"
-          + (f" ({torch.cuda.get_device_name(0)})" if cuda_ok else ""))
+    def _do_warmup(set_status):
+        from ui.logs import latest_line
+        set_status("Loading translation model... (first run downloads ~5 GB, "
+                   "may take 10+ minutes)")
+
+        # Pump the most recent stdout line into the splash label at 4 Hz so
+        # the user sees HF download progress / model load steps live.
+        pump_stop = threading.Event()
+
+        def pump():
+            last = None
+            while not pump_stop.is_set():
+                line = latest_line()
+                if line and line != last:
+                    set_status(line)
+                    last = line
+                pump_stop.wait(0.25)
+
+        pump_thread = threading.Thread(target=pump, daemon=True)
+        pump_thread.start()
+
+        warm_t0 = _t()
+        try:
+            warmup()
+        finally:
+            pump_stop.set()
+            pump_thread.join(timeout=0.5)
+        elapsed = _ms(warm_t0, _t()) / 1000
+        set_status(f"Ready (warmup {elapsed:.1f}s). Opening overlay...")
+        return elapsed
 
     print("[main] pre-warming translation model ...", flush=True)
-    warm_t0 = _t()
-    warmup()
-    print(f"[main] warmup done in {_ms(warm_t0, _t())/1000:.1f}s", flush=True)
+    _, exc = run_with_splash(
+        _do_warmup,
+        title="Korean OCR Translator",
+        initial="Starting up...",
+    )
+    if exc is not None:
+        _fatal(f"Model load failed: {type(exc).__name__}: {exc}")
 
     # Import PyQt6 only AFTER the LLM is fully loaded in VRAM, otherwise
     # Qt's graphics plugin init can crash bitsandbytes silently on Windows.
@@ -394,6 +499,8 @@ def main():
             results_getter=get_results_snapshot,
             stop_event=stop_event,
             restart_capture=restart_capture,
+            on_pause_toggle=toggle_pause,
+            is_paused=is_paused,
         )
     finally:
         stop_event.set()
@@ -405,4 +512,13 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n[main] interrupted by user (Ctrl+C)", flush=True)
+        stop_event.set()
+    except SystemExit:
+        raise
+    except Exception as e:
+        print(f"[main] fatal: {type(e).__name__}: {e}", flush=True)
+        raise

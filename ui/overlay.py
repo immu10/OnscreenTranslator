@@ -170,13 +170,23 @@ class FloatingButton(QWidget):
 
     SIZE = 44
 
-    def __init__(self, on_settings, on_logs, on_quit):
+    def __init__(self, on_settings, on_logs, on_quit,
+                 on_pause_toggle=None, is_paused=None):
         super().__init__()
         self.on_settings = on_settings
         self.on_logs = on_logs
         self.on_quit = on_quit
+        self.on_pause_toggle = on_pause_toggle
+        self.is_paused = is_paused or (lambda: False)
         self._drag_offset = None
         self._dragged = False
+        # Defer single-click-opens-menu so it doesn't fire when the user
+        # is actually performing a double-click (which toggles pause).
+        self._click_timer = QTimer(self)
+        self._click_timer.setSingleShot(True)
+        self._click_timer.timeout.connect(self._deferred_click)
+        self._pending_click_pos = None
+        self._just_double_clicked = False
 
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
@@ -197,31 +207,61 @@ class FloatingButton(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
 
+        paused = self.is_paused()
+        ring_color = QColor(140, 140, 140, 230) if paused else QColor(0, 200, 80, 230)
+        glyph_color = QColor(180, 180, 180, 240) if paused else QColor(255, 255, 255, 240)
+
         # Translucent dark fill, accent ring.
         p.setBrush(QColor(20, 20, 20, 210))
-        p.setPen(QPen(QColor(0, 200, 80, 230), 2))
+        p.setPen(QPen(ring_color, 2))
         p.drawEllipse(2, 2, self.SIZE - 4, self.SIZE - 4)
 
-        # 'T' glyph in the center.
-        p.setPen(QColor(255, 255, 255, 240))
-        f = QFont("Segoe UI", 16)
-        f.setBold(True)
-        p.setFont(f)
-        p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "T")
+        # 'T' glyph (or pause bars when paused) in the center.
+        p.setPen(glyph_color)
+        if paused:
+            # Two short vertical bars.
+            cx = self.SIZE // 2
+            cy = self.SIZE // 2
+            bw, bh, gap = 4, 16, 4
+            p.fillRect(cx - gap - bw, cy - bh // 2, bw, bh, glyph_color)
+            p.fillRect(cx + gap,       cy - bh // 2, bw, bh, glyph_color)
+        else:
+            f = QFont("Segoe UI", 16)
+            f.setBold(True)
+            p.setFont(f)
+            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "T")
 
     def _show_menu(self, global_pos):
         menu = QMenu(self)
+        pause_label = "Resume" if self.is_paused() else "Pause"
+        if self.on_pause_toggle is not None:
+            menu.addAction(pause_label).triggered.connect(self._toggle_pause)
+            menu.addSeparator()
         menu.addAction("Settings...").triggered.connect(self.on_settings)
         menu.addAction("Logs...").triggered.connect(self.on_logs)
         menu.addSeparator()
         menu.addAction("Quit").triggered.connect(self.on_quit)
         menu.exec(global_pos)
 
+    def _toggle_pause(self):
+        if self.on_pause_toggle is not None:
+            self.on_pause_toggle()
+            self.update()  # repaint with new state
+
+    def _deferred_click(self):
+        # Single-click survived the double-click window — open the menu.
+        if self._pending_click_pos is not None:
+            self._show_menu(self._pending_click_pos)
+            self._pending_click_pos = None
+
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
             self._drag_offset = e.globalPosition().toPoint() - self.pos()
             self._dragged = False
         elif e.button() == Qt.MouseButton.RightButton:
+            # Right-click bypasses the double-click defer — open immediately.
+            self._click_timer.stop()
+            self._pending_click_pos = None
             self._show_menu(e.globalPosition().toPoint())
 
     def mouseMoveEvent(self, e):
@@ -229,17 +269,36 @@ class FloatingButton(QWidget):
             new_pos = e.globalPosition().toPoint() - self._drag_offset
             self.move(new_pos)
             self._dragged = True
+            # A drag started — cancel any pending click action.
+            self._click_timer.stop()
+            self._pending_click_pos = None
 
     def mouseReleaseEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
-            if not self._dragged:
-                # treat as a click → open menu at cursor
-                self._show_menu(e.globalPosition().toPoint())
+            if self._just_double_clicked:
+                # This release is the tail of a double-click — don't re-arm
+                # the deferred menu-open or it'll fire 250 ms later.
+                self._just_double_clicked = False
+            elif not self._dragged:
+                # Defer the menu-open so a follow-up double-click can pre-empt it.
+                self._pending_click_pos = e.globalPosition().toPoint()
+                interval = QApplication.doubleClickInterval()
+                self._click_timer.start(interval)
             self._drag_offset = None
             self._dragged = False
 
+    def mouseDoubleClickEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            # Pre-empt the deferred single-click menu open AND mark so the
+            # following mouseReleaseEvent doesn't re-arm it.
+            self._click_timer.stop()
+            self._pending_click_pos = None
+            self._just_double_clicked = True
+            self._toggle_pause()
 
-def run(monitor_index, region, results_getter, stop_event, restart_capture=None):
+
+def run(monitor_index, region, results_getter, stop_event, restart_capture=None,
+        on_pause_toggle=None, is_paused=None):
     """Blocks until stop_event is set or the Qt app quits.
 
     monitor_index: which screen the overlay covers (matches dxcam.output_idx).
@@ -328,6 +387,7 @@ def run(monitor_index, region, results_getter, stop_event, restart_capture=None)
     # Floating handle (Discord-overlay style) — drag to reposition, click for menu.
     handle = FloatingButton(
         on_settings=open_settings, on_logs=open_log_viewer, on_quit=quit_app,
+        on_pause_toggle=on_pause_toggle, is_paused=is_paused,
     )
     _exclude_from_capture(handle)
     handle.show()
@@ -340,15 +400,30 @@ def run(monitor_index, region, results_getter, stop_event, restart_capture=None)
     pix.fill(QColor(0, 200, 80))
     tray.setIcon(QIcon(pix))
     tray.setToolTip("Korean OCR Translator — right-click to open menu")
-    tray_menu = QMenu()
-    tray_menu.addAction("Settings...").triggered.connect(open_settings)
-    tray_menu.addAction("Logs...").triggered.connect(open_log_viewer)
-    tray_menu.addSeparator()
-    tray_menu.addAction("Show handle").triggered.connect(
-        lambda: (handle.show(), handle.raise_())
-    )
-    tray_menu.addAction("Quit").triggered.connect(quit_app)
-    tray.setContextMenu(tray_menu)
+    def _toggle_pause_from_tray():
+        if on_pause_toggle is not None:
+            on_pause_toggle()
+            handle.update()  # keep handle visual in sync
+
+    def _rebuild_tray_menu():
+        tray_menu = QMenu()
+        if on_pause_toggle is not None:
+            label = "Resume" if (is_paused and is_paused()) else "Pause"
+            tray_menu.addAction(label).triggered.connect(_toggle_pause_from_tray)
+            tray_menu.addSeparator()
+        tray_menu.addAction("Settings...").triggered.connect(open_settings)
+        tray_menu.addAction("Logs...").triggered.connect(open_log_viewer)
+        tray_menu.addSeparator()
+        tray_menu.addAction("Show handle").triggered.connect(
+            lambda: (handle.show(), handle.raise_())
+        )
+        tray_menu.addAction("Quit").triggered.connect(quit_app)
+        tray.setContextMenu(tray_menu)
+        refs["tray_menu"] = tray_menu  # keep alive
+
+    _rebuild_tray_menu()
+    # Rebuild on every show so the Pause/Resume label is always current.
+    tray.activated.connect(lambda _reason: _rebuild_tray_menu())
     tray.show()
     refs["tray"] = tray
 

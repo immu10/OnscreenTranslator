@@ -50,10 +50,27 @@ class _Tee:
         global _seq
         with _lock:
             self._pending += s
-            while "\n" in self._pending:
-                line, self._pending = self._pending.split("\n", 1)
-                _buffer.append(line)
-                _seq += 1
+            # Split on both \n (real line) and \r (tqdm/progress in-place
+            # update). For \r we replace the most recent buffer entry instead
+            # of appending — so a tqdm progress bar shows as ONE evolving
+            # latest line, not thousands of stacked rows.
+            while True:
+                nl = self._pending.find("\n")
+                cr = self._pending.find("\r")
+                if nl == -1 and cr == -1:
+                    break
+                if nl == -1 or (cr != -1 and cr < nl):
+                    line, self._pending = self._pending[:cr], self._pending[cr + 1:]
+                    if line:
+                        if _buffer and _buffer[-1].startswith(line[:8]):
+                            _buffer[-1] = line   # in-place progress update
+                        else:
+                            _buffer.append(line)
+                            _seq += 1
+                else:
+                    line, self._pending = self._pending[:nl], self._pending[nl + 1:]
+                    _buffer.append(line)
+                    _seq += 1
 
     def flush(self):
         try:
@@ -79,6 +96,16 @@ def install_tap():
     sys.stdout = _Tee(sys.stdout, "out")
     sys.stderr = _Tee(sys.stderr, "err")
     _installed = True
+
+
+def latest_line():
+    """Return the most recent non-empty buffered line, or '' if none."""
+    with _lock:
+        for line in reversed(_buffer):
+            s = line.strip()
+            if s:
+                return s
+        return ""
 
 
 def snapshot():

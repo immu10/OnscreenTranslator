@@ -2,6 +2,8 @@ import threading
 import torch
 import easyocr
 
+from paths import easyocr_model_dir
+
 LANGS = ['ko', 'en']
 
 _lock = threading.Lock()
@@ -12,8 +14,14 @@ def _ensure():
     global _reader
     if _reader is None:
         gpu = torch.cuda.is_available()
-        print(f"[ocr] loading EasyOCR langs={LANGS} gpu={gpu} ...", flush=True)
-        _reader = easyocr.Reader(LANGS, gpu=gpu)
+        model_dir = easyocr_model_dir()
+        print(f"[ocr] loading EasyOCR langs={LANGS} gpu={gpu} "
+              f"model_dir={model_dir} ...", flush=True)
+        _reader = easyocr.Reader(
+            LANGS, gpu=gpu,
+            model_storage_directory=model_dir,
+            user_network_directory=model_dir,
+        )
         print("[ocr] EasyOCR ready", flush=True)
 
 

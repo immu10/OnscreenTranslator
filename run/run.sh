@@ -4,6 +4,9 @@
 
 set -euo pipefail
 
+# Always run from project root regardless of where this script was invoked.
+cd "$(dirname "$0")/.."
+
 mkdir -p logs
 LOG="logs/run-$(date +%Y%m%d-%H%M%S).log"
 

@@ -1,10 +1,8 @@
 import os
 import threading
 
-# Project root is one level up from this file (text/translate.py → project/).
-# Keep the cache at <project>/.hf_cache so it survives package moves.
-_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-os.environ.setdefault("HF_HOME", os.path.join(_PROJECT_ROOT, ".hf_cache"))
+from paths import hf_cache_dir
+os.environ.setdefault("HF_HOME", hf_cache_dir())
 
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig

@@ -9,6 +9,8 @@ import ctypes
 import json
 import os
 
+from paths import settings_file
+
 from PyQt6.QtWidgets import (
     QDialog, QFormLayout, QSpinBox, QDoubleSpinBox, QComboBox,
     QPushButton, QColorDialog, QCheckBox, QDialogButtonBox, QApplication,
@@ -16,8 +18,6 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QRect
 from PyQt6.QtGui import QColor, QPainter, QPen, QFont
-
-SETTINGS_FILE = "settings.json"
 
 DEFAULTS = {
     "monitor_index": 1,           # which screen to capture
@@ -43,25 +43,27 @@ SETTINGS = dict(DEFAULTS)
 
 def load():
     """Read settings.json into SETTINGS (only known keys, default-fallback)."""
-    if not os.path.exists(SETTINGS_FILE):
+    path = settings_file()
+    if not os.path.exists(path):
         return
     try:
-        with open(SETTINGS_FILE, encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             loaded = json.load(f)
         for k in DEFAULTS:
             if k in loaded:
                 SETTINGS[k] = loaded[k]
-        print(f"[settings] loaded from {SETTINGS_FILE}", flush=True)
+        print(f"[settings] loaded from {path}", flush=True)
     except Exception as e:
         print(f"[settings] load failed: {e}", flush=True)
 
 
 def save():
     """Write current SETTINGS to settings.json."""
+    path = settings_file()
     try:
-        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(SETTINGS, f, indent=2, ensure_ascii=False)
-        print(f"[settings] saved to {SETTINGS_FILE}", flush=True)
+        print(f"[settings] saved to {path}", flush=True)
     except Exception as e:
         print(f"[settings] save failed: {e}", flush=True)
 

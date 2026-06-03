@@ -21,3 +21,6 @@ sentencepiece
 accelerate==1.1.1
 bitsandbytes==0.43.3
 # autoawq  # uncomment + swap translate.py if you get this installing on Windows
+
+# Build-only (for producing the .exe — see BUILD.md). Skip for runtime install.
+pyinstaller>=6.10

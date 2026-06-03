@@ -15,5 +15,8 @@ env/
 *.png
 tessdata/
 .hf_cache/
+.easyocr/
 settings.json
 logs/
+dist/
+build/

@@ -7,6 +7,9 @@
 #   which trips on every progress-bar line. We let cmd.exe do the stderr merge
 #   so PowerShell only sees one combined stdout stream.
 
+# Always run from project root regardless of where this script was invoked.
+Set-Location (Split-Path $PSScriptRoot -Parent)
+
 if (-not (Test-Path "logs")) {
     New-Item -ItemType Directory -Path "logs" | Out-Null
 }

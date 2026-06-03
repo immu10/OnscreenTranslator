@@ -3,5 +3,6 @@
 from .overlay import run, Overlay, FloatingButton
 from . import settings
 from . import logs
+from . import splash
 
-__all__ = ["run", "Overlay", "FloatingButton", "settings", "logs"]
+__all__ = ["run", "Overlay", "FloatingButton", "settings", "logs", "splash"]
