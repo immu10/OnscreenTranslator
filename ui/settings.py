@@ -312,6 +312,10 @@ class SettingsDialog(QDialog):
         buttons.button(QDialogButtonBox.StandardButton.Close).clicked.connect(self.close)
         layout.addRow(buttons)
 
+    def showEvent(self, event):
+        _exclude_widget_from_capture(self)
+        super().showEvent(event)
+
     def _region_text(self):
         r = SETTINGS.get("custom_region")
         if r is None:
