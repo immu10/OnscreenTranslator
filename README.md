@@ -17,6 +17,10 @@ swapping tabs to a separate translator.
 > manhwa, VNs, YouTube, single-player games, or anything *without* kernel
 > anti-cheat. **You assume all risk if you ignore this.**
 
+## DEMO
+yt https://youtu.be/WGv9_rZozUE
+
+
 ## Contents
 
 - [Overview](#overview)
