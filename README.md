@@ -19,7 +19,9 @@ swapping tabs to a separate translator.
 
 ## Contents
 
-- [Pipeline](#pipeline)
+- [Overview](#overview)
+- [Tech stack](#tech-stack)
+- [Architecture](#architecture)
 - [Project layout](#project-layout)
 - [Installation](#installation)
 - [Running](#running)
@@ -29,28 +31,132 @@ swapping tabs to a separate translator.
 - [Known limitations](#known-limitations)
 - [Architecture choices worth knowing](#architecture-choices-worth-knowing)
 
-## Pipeline
+## Overview
+
+Captures your chosen monitor region, runs Korean OCR on each frame's text
+boxes, translates each new phrase locally with a 4-bit-quantized Qwen 2.5
+7B chat model (no cloud API), and floats the English result beside the
+source text in a transparent click-through overlay. Built for reading
+Korean wuxia/manhwa webnovels alongside the page rather than swapping
+tabs to a separate translator.
+
+Designed to be:
+
+- **Fully offline** after the one-time model download — no API keys, no
+  network calls per translation.
+- **Portable** — settings, model cache, OCR weights, and logs all live in
+  the app folder. Nothing in `%APPDATA%`, nothing in the registry, nothing
+  in `C:\`. Unzip anywhere user-writable and run.
+- **Distributable as a single .exe** (PyInstaller onedir) to friends with
+  NVIDIA GPUs — no Python install on the recipient.
+- **Pausable** — double-click the floating handle to halt detection,
+  translation, and the overlay; double-click again to resume.
+
+## Tech stack
+
+| Layer | Tool | Why this choice |
+|-------|------|-----------------|
+| Screen capture | `dxcam` (DXGI Desktop Duplication) | GPU-backed, lowest-latency Windows path; supports per-region capture |
+| OCR detect + recognize | `easyocr` (PyTorch) | Solid Korean accuracy, single-package install |
+| LLM translation | `Qwen2.5-7B-Instruct` + `bitsandbytes` nf4 4-bit | Strong Korean→English; ~5 GB VRAM |
+| Inference runtime | `transformers` + `torch` (CUDA 12.1) | Standard HF stack, `AutoModelForCausalLM` API |
+| Overlay UI | `PyQt6` transparent click-through `QWidget` | Native widgets, per-pixel alpha, click-through via `Qt.WindowTransparentForInput` |
+| Floating handle + tray | `PyQt6` (`QSystemTrayIcon`, custom `QWidget`) | Discord-overlay-style draggable button, plus tray fallback |
+| Splash window | `tkinter` (stdlib) | GDI-only — doesn't init Qt's GPU plugin before bnb loads |
+| Capture exclusion | Win32 `SetWindowDisplayAffinity` (`WDA_EXCLUDEFROMCAPTURE`) | Prevents dxcam from re-OCR'ing the overlay's own translations |
+| Settings persistence | JSON beside the app | Portable, human-editable |
+| Live log viewer | Custom stdout/stderr tee → ring buffer → Qt `QPlainTextEdit` | See model load + OCR/translate timings without a console |
+| Packaging | PyInstaller (onedir) | Single folder you can zip and share; no Python on the recipient |
+
+Tested on Windows 11 + Python 3.11 + NVIDIA RTX 4070 SUPER. AMD/Intel GPUs
+are not supported in this build (`bitsandbytes` is CUDA-only on Windows);
+swapping translation to llama.cpp + Vulkan would unlock cross-vendor
+support — see [Performance notes](#performance-notes).
+
+## Architecture
+
+Four threads share state through three lock-guarded objects. Capture is
+"latest-frame wins"; detection is gated by a thumbnail diff to skip static
+screens; OCR runs on a drop-oldest queue so the translator never falls
+behind on stale crops.
 
 ```
-dxcam ─► capture thread ─► detector thread ─► OCR/translate thread ─► PyQt6 overlay
-            (60 FPS)         (EasyOCR detect    (EasyOCR recognize       (transparent
-                              on downscaled       + Qwen 7B 4-bit         click-through
-                              frame)              translate)              window beside
-                                                                          each box)
+   ┌─────────────────────────────────────────────────────────────────┐
+   │                  DXGI Desktop Duplication                       │
+   │                         (dxcam)                                 │
+   └─────────────────────────────┬───────────────────────────────────┘
+                                 │ raw frames (target 60 FPS)
+                                 ▼
+   ┌─────────────────────────────────────────────────────────────────┐
+   │                   capture_worker  [thread #1]                   │
+   │                  pulls frames, overwrites state                 │
+   └─────────────────────────────┬───────────────────────────────────┘
+                                 │ writes
+                                 ▼
+                  ╔═══════════════════════════════╗
+                  ║      latest_frame  (lock)     ║   shared state
+                  ╚═══════════════╤═══════════════╝
+                                  │ snapshot + 32×32 thumb-diff
+                                  ▼
+   ┌─────────────────────────────────────────────────────────────────┐
+   │                   detector_worker  [thread #2]                  │
+   │   • same-frame skip (abs-diff < 5 → idle 50ms)                  │
+   │   • EasyOCR.detect() on 720p downscale                          │
+   │   • union-find box merge (group_boxes)                          │
+   │   • IoU carry-over of (text, translation) from prev frame       │
+   │   • honours paused_event → idle + clears results                │
+   └─────────────────────┬────────────────────────────┬──────────────┘
+                         │ new crops only             │ writes
+                         ▼                            ▼
+            ╔══════════════════════════╗   ╔══════════════════════════╗
+            ║   ocr_queue (drop-old)   ║   ║       results  (lock)    ║◄──┐
+            ║   bounded depth = 4      ║   ║  list[(box, ko, en)]     ║   │
+            ╚════════════╤═════════════╝   ╚══════════════════════════╝   │
+                         │                                                │
+                         ▼                                                │
+   ┌─────────────────────────────────────────────────────────────────┐    │
+   │                     ocr_worker  [thread #3]                     │    │
+   │   • cv2.resize cubic upscale (ocr_upscale)                      │    │
+   │   • EasyOCR.recognize() on the crop                             │    │
+   │   • translation_cache hit? → reuse                              │    │
+   │   • else → translate() through Qwen 7B (bnb nf4)                │    │
+   │   • IoU back-match → patch the right entry in results ──────────┼────┘
+   └────────────────────┬───────────────────────┬────────────────────┘
+                        │                       │
+                        ▼                       ▼
+            ╔══════════════════════════╗   ┌──────────────────────┐
+            ║   translation_cache      ║   │   Qwen 2.5 7B 4-bit  │
+            ║      ko → en  (dict)     ║   │   bnb nf4 / CUDA     │
+            ╚══════════════════════════╝   └──────────────────────┘
+
+   ┌─────────────────────────────────────────────────────────────────┐
+   │                   Qt main thread  [thread #4]                   │
+   │   • Overlay paints results @ 30 Hz (reads results under lock)   │
+   │   • FloatingButton: drag, double-click pause, menu              │
+   │   • System tray icon                                            │
+   │   • Settings / Logs dialogs (all WDA_EXCLUDEFROMCAPTURE)        │
+   └─────────────────────────────────────────────────────────────────┘
 ```
+
+Per-stage detail:
 
 - **Capture** — `dxcam` Desktop Duplication grabs a configurable region of a
   chosen monitor (top/bottom percent crop or a drag-picked rectangle).
 - **Detection** — EasyOCR on a 720p downscale to find text bounding boxes; boxes
   are merged via union-find (custom `group_boxes`) to coalesce paragraph-level
-  blocks.
+  blocks. IoU ≥ 0.5 against the previous frame carries existing translations
+  forward so the overlay stays stable across small camera jitter.
 - **Recognition** — EasyOCR's Korean recognizer runs on the full-res crop of
   each new box (optional 2× cubic upscale for stylized fonts).
 - **Translation** — Qwen2.5-7B-Instruct in 4-bit (bitsandbytes nf4) on local
   CUDA. Content-keyed cache eliminates re-translation of repeated phrases.
 - **Display** — PyQt6 transparent click-through overlay floats English text
   beside each box (auto-positions right/left/below/above to stay on-screen),
-  excluded from screen capture so it isn't re-OCR'd.
+  excluded from screen capture via `SetWindowDisplayAffinity` so it isn't
+  re-OCR'd by dxcam.
+- **Pause** — `paused_event` short-circuits the detector loop and clears
+  `results` under the lock; the OCR worker idles naturally as the queue
+  drains. Resume forces one detection pass by resetting `prev_thumb`.
 
 ## Project layout
 
@@ -247,3 +353,7 @@ Translation dominates wall-clock by far. Speedups not yet applied:
 - **Portable app folder.** Settings, HF cache, and EasyOCR models all live
   next to the exe (or in the project root during dev). No `%APPDATA%`, no
   registry, nothing in `C:\` — the whole app is a self-contained directory.
+
+## Tags
+
+`LLM` · `Qt` · `Qwen` · `OCR`
